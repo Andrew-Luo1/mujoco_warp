@@ -397,6 +397,13 @@ class Model:
     qM_mulm_i: sparse mass matrix addressing
     qM_mulm_j: sparse mass matrix addressing
     qM_madr_ij: sparse mass matrix addressing
+    M_rownnz: number of non-zeros in each row of M           (nv,)
+    M_rowadr: address of each row in M_colind                (nv,)
+    M_colind: column indices of non-zeros in M               (nM,)
+    M_diag_ind: index of corresponding diagonal entry in M   (nM,)
+    M_diags: diagonal indices of M                           (nv,)
+    M_loop_helper: helper for k-kernel launch factorM        (nM - nv, 2)
+    M_loop_helper_starts: starting index of each row in M_loop_helper (nv + 1,)
     qLD_update_tree: dof tree ordering for qLD updates
     qLD_update_treeadr: index of each dof tree level
     qLD_tile: tiling configuration
@@ -519,6 +526,14 @@ class Model:
   qM_mulm_i: wp.array(dtype=wp.int32, ndim=1)  # warp only
   qM_mulm_j: wp.array(dtype=wp.int32, ndim=1)  # warp only
   qM_madr_ij: wp.array(dtype=wp.int32, ndim=1)  # warp only
+  M_rownnz: wp.array(dtype=wp.int32, ndim=1)  # warp only
+  M_rowadr: wp.array(dtype=wp.int32, ndim=1)  # warp only
+  M_colind: wp.array(dtype=wp.int32, ndim=1)  # warp only
+  M_diag_ind: wp.array(dtype=wp.int32, ndim=1)  # warp only
+  M_diags: wp.array(dtype=wp.int32, ndim=1)  # warp only
+  M_loop_helper: wp.array(dtype=wp.int32, ndim=2)  # warp only
+  M_loop_helper_starts: wp.array(dtype=wp.int32, ndim=1)  # warp only
+  M_loop_helper_starts_cpu: wp.array(dtype=wp.int32, ndim=1)  # warp only
   qLD_update_tree: wp.array(dtype=wp.vec3i, ndim=1)  # warp only
   qLD_update_treeadr: wp.array(dtype=wp.int32, ndim=1)  # warp only
   qLD_tile: wp.array(dtype=wp.int32, ndim=1)  # warp only
@@ -684,7 +699,9 @@ class Data:
     crb: com-based composite inertia and mass                   (nworld, nbody, 10)
     qM: total inertia (sparse) (nworld, 1, nM) or               (nworld, nv, nv) if dense
     qLD: L'*D*L factorization of M (sparse) (nworld, 1, nM) or  (nworld, nv, nv) if dense
+    qLD_csr_index_vars: CSR index variables                     (nM - nv, 3)
     qLDiagInv: 1/diag(D)                                        (nworld, nv)
+    qLDiagInvnM: 1/diag(D) for all entries                      (nworld, nM)
     actuator_velocity: actuator velocities                      (nworld, nu)
     cvel: com-based velocity (rot:lin)                          (nworld, nbody, 6)
     cdof_dot: time-derivative of cdof (rot:lin)                 (nworld, nv, 6)
@@ -726,6 +743,7 @@ class Data:
     collision_type: collision types from broadphase             (nconmax,)
     collision_worldid: collision world ids from broadphase      (nconmax,)
     ncollision: collision count from broadphase                 ()
+
   """
 
   ncon: wp.array(dtype=wp.int32, ndim=1)
@@ -762,7 +780,9 @@ class Data:
   crb: wp.array(dtype=vec10, ndim=2)
   qM: wp.array(dtype=wp.float32, ndim=3)
   qLD: wp.array(dtype=wp.float32, ndim=3)
+  qLD_csr_index_vars: wp.array(dtype=wp.int32, ndim=2)  # warp only
   qLDiagInv: wp.array(dtype=wp.float32, ndim=2)
+  qLDiagInvnM: wp.array(dtype=wp.float32, ndim=2)
   actuator_velocity: wp.array(dtype=wp.float32, ndim=2)
   cvel: wp.array(dtype=wp.spatial_vector, ndim=2)
   cdof_dot: wp.array(dtype=wp.spatial_vector, ndim=2)

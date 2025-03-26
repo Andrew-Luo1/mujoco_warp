@@ -91,6 +91,11 @@ def _main(argv: Sequence[str]):
     mujoco.mj_resetDataKeyframe(m, d, _KEYFRAME.value)
   # populate some constraints
   mujoco.mj_forward(m, d)
+  
+  # let dynamics get state significantly non-zero
+  d.qvel = np.random.uniform(-0.01, 0.01, m.nv)
+  mujoco.mj_step(m, d, 3)
+  mujoco.mj_forward(m, d)
 
   if _CLEAR_KERNEL_CACHE.value:
     wp.clear_kernel_cache()

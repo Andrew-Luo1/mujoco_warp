@@ -314,44 +314,7 @@ def crb(m: Model, d: Data):
     wp.launch(qM_dense, dim=(d.nworld, m.nv), inputs=[m, d])
 
 
-# def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
-#   """Sparse L'*D*L factorizaton of inertia-like matrix M, assumed spd."""
-
-#   @kernel
-#   def qLD_acc(m: Model, leveladr: int, L: array3df):
-#     worldid, nodeid = wp.tid()
-#     update = m.qLD_update_tree[leveladr + nodeid]
-#     i, k, Madr_ki = update[0], update[1], update[2]
-#     Madr_i = m.dof_Madr[i]
-#     # tmp = M(k,i) / M(k,k)
-#     tmp = L[worldid, 0, Madr_ki] / L[worldid, 0, m.dof_Madr[k]]
-#     for j in range(m.dof_Madr[i + 1] - Madr_i):
-#       # M(i,j) -= M(k,j) * tmp
-#       wp.atomic_sub(L[worldid, 0], Madr_i + j, L[worldid, 0, Madr_ki + j] * tmp)
-#     # M(k,i) = tmp
-#     L[worldid, 0, Madr_ki] = tmp
-
-#   @kernel
-#   def qLDiag_div(m: Model, L: array3df, D: array2df):
-#     worldid, dofid = wp.tid()
-#     D[worldid, dofid] = 1.0 / L[worldid, 0, m.dof_Madr[dofid]]
-
-#   kernel_copy(L, M)
-
-#   qLD_update_treeadr = m.qLD_update_treeadr.numpy()
-
-#   for i in reversed(range(len(qLD_update_treeadr))):
-#     if i == len(qLD_update_treeadr) - 1:
-#       beg, end = qLD_update_treeadr[i], m.qLD_update_tree.shape[0]
-#     else:
-#       beg, end = qLD_update_treeadr[i], qLD_update_treeadr[i + 1]
-#     wp.launch(qLD_acc, dim=(d.nworld, end - beg), inputs=[m, beg, L])
-
-#   wp.launch(qLDiag_div, dim=(d.nworld, m.nv), inputs=[m, L, D])
-
-
-#### ORIGINAL-LIKE
-# Outer two loops traverse same # elements as qLD_update_tree.
+#### One launch per row. 34 ns.
 def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
   """Sparse L'*D*L factorizaton of inertia-like matrix M, assumed spd."""
 
@@ -363,26 +326,24 @@ def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
     L[worldid, 0, ind] = M[worldid, 0, mapM2M[ind]]
   wp.launch(copy_CSR, dim=(d.nworld, m.nM), inputs=[L, M, d.mapM2M])
 
-  rowadr = d.M_rowadr.numpy()
-  rownnz = d.M_rownnz.numpy()
-  colind = d.M_colind.numpy()
-
   @kernel
   def M_k_i(mat: wp.array(dtype=wp.float32, ndim=3),
-                 rowadr: wp.array(dtype=wp.int32, ndim=1),
-                 rownnz: wp.array(dtype=wp.int32, ndim=1),
-                 colind: wp.array(dtype=wp.int32, ndim=1),
-                 diag_ind: wp.int32,
-                 rowadr_k: wp.int32,
-                 adr: wp.int32):
+            rowadr: wp.array(dtype=wp.int32, ndim=1),
+            colind: wp.array(dtype=wp.int32, ndim=1),
+            diag_ind: wp.int32,
+            rowadr_k: wp.int32,
+            m_loop_helper: wp.array(dtype=wp.int32, ndim=2),
+            beg: wp.int32,
+            end: wp.int32):
     """ Process M(k, i) from Featherstone 2008, Table 6.3 """
-    worldid = wp.tid()
+    worldid, thread_offset = wp.tid()
+    update = m_loop_helper[beg + thread_offset]
+    adr = update[0]
+    slice_ind = update[1]
     invD = 1.0 / mat[worldid, 0, diag_ind]
     tmp = mat[worldid, 0, adr] * invD
     i = colind[adr]
-    for slice_ind in range(rownnz[i]):
-      mat[worldid, 0, rowadr[i] + slice_ind] -= tmp * mat[worldid, 0, rowadr_k + slice_ind]
-    mat[worldid, 0, adr] = tmp
+    mat[worldid, 0, rowadr[i] + slice_ind] -= tmp * mat[worldid, 0, rowadr_k + slice_ind]
 
   @kernel
   def qlDiag_div(rownnz: wp.array(dtype=wp.int32, ndim=1), 
@@ -391,24 +352,112 @@ def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
     worldid, dofid = wp.tid()
     D[worldid, dofid] = 1.0 / L[worldid, 0, rowadr[dofid] + rownnz[dofid] - 1]
 
-  for k in reversed(range(m.nv)):
+  @kernel
+  def M_k_i_scale(mat: wp.array(dtype=wp.float32, ndim=3),
+                  diag_ind: wp.array(dtype=wp.int32, ndim=1)):
+    worldid, i = wp.tid()
+    invD = 1.0 / mat[worldid, 0, diag_ind[i]]
+    mat[worldid, 0, i] *= invD
+
+  @kernel
+  def store_diagonals(mat: wp.array(dtype=wp.float32, ndim=3),
+                      D: wp.array(dtype=wp.float32, ndim=2),
+                      diag_inds: wp.array(dtype=wp.int32, ndim=1)):
+    worldid, i = wp.tid()
+    D[worldid, i] = mat[worldid, 0, diag_inds[i]]
+
+  @kernel
+  def restore_diagonals(mat: wp.array(dtype=wp.float32, ndim=3),
+                        D: wp.array(dtype=wp.float32, ndim=2),
+                        diag_inds: wp.array(dtype=wp.int32, ndim=1)):
+    worldid, i = wp.tid()
+    mat[worldid, 0, diag_inds[i]] = D[worldid, i]
+
+  rowadr = m.M_rowadr.numpy()
+  rownnz = m.M_rownnz.numpy()
+
+  m_loop_helper_starts = m.M_loop_helper_starts_cpu.numpy()
+  for i, k in enumerate(reversed(range(m.nv))):
+    beg, end = m_loop_helper_starts[i], m_loop_helper_starts[i + 1]
     rowadr_k = rowadr[k]
-    diag_k = rowadr_k + rownnz[k] - 1
+    diag_k = rowadr[k] + rownnz[k] - 1
+    wp.launch(M_k_i,
+              dim=(d.nworld, end-beg),
+              inputs=[
+                L,
+                d.M_rowadr,
+                d.M_colind,
+                wp.int32(diag_k),
+                wp.int32(rowadr_k),
+                m.M_loop_helper,
+                wp.int32(beg),
+                wp.int32(end)
+              ])
 
-    for adr in range(diag_k - 1, rowadr_k - 1, -1):
-      wp.launch(M_k_i, dim=(d.nworld), inputs=[
-        L,
-        wp.array(rowadr, dtype=wp.int32, ndim=1),
-        wp.array(rownnz, dtype=wp.int32, ndim=1),
-        wp.array(colind, dtype=wp.int32, ndim=1),
-        wp.int32(diag_k),
-        wp.int32(rowadr_k),
-        wp.int32(adr)
-      ])
-
+  # Store diagonals
+  wp.launch(store_diagonals,
+            dim=(d.nworld, m.nv),
+            inputs=[
+              L,
+              D,
+              m.M_diags
+            ])
+  wp.launch(M_k_i_scale,
+            dim=(d.nworld, m.nM),
+            inputs=[
+              L,
+              m.M_diag_ind
+            ])
+  # Restore diagonals
+  wp.launch(restore_diagonals,
+            dim=(d.nworld, m.nv),
+            inputs=[
+              L,
+              D,
+              m.M_diags
+            ])
   wp.launch(qlDiag_div, dim=(d.nworld, m.nv), inputs=[d.M_rownnz, d.M_rowadr, L, D])
 
-# #### Separate Kernels
+
+def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
+  """Sparse L'*D*L factorizaton of inertia-like matrix M, assumed spd."""
+
+  @kernel
+  def qLD_acc(m: Model, leveladr: int, L: array3df):
+    worldid, nodeid = wp.tid()
+    update = m.qLD_update_tree[leveladr + nodeid]
+    i, k, Madr_ki = update[0], update[1], update[2]
+    Madr_i = m.dof_Madr[i]
+    # tmp = M(k,i) / M(k,k)
+    tmp = L[worldid, 0, Madr_ki] / L[worldid, 0, m.dof_Madr[k]]
+    for j in range(m.dof_Madr[i + 1] - Madr_i):
+      # M(i,j) -= M(k,j) * tmp
+      wp.atomic_sub(L[worldid, 0], Madr_i + j, L[worldid, 0, Madr_ki + j] * tmp)
+    # M(k,i) = tmp
+    L[worldid, 0, Madr_ki] = tmp
+
+  @kernel
+  def qLDiag_div(m: Model, L: array3df, D: array2df):
+    worldid, dofid = wp.tid()
+    D[worldid, dofid] = 1.0 / L[worldid, 0, m.dof_Madr[dofid]]
+
+  kernel_copy(L, M)
+
+  qLD_update_treeadr = m.qLD_update_treeadr.numpy()
+
+  for i in reversed(range(len(qLD_update_treeadr))):
+    if i == len(qLD_update_treeadr) - 1:
+      beg, end = qLD_update_treeadr[i], m.qLD_update_tree.shape[0]
+    else:
+      beg, end = qLD_update_treeadr[i], qLD_update_treeadr[i + 1]
+    wp.launch(qLD_acc, dim=(d.nworld, end - beg), inputs=[m, beg, L])
+
+  wp.launch(qLDiag_div, dim=(d.nworld, m.nv), inputs=[m, L, D])
+
+
+
+
+# #### Takes 63 units, matching legacy.
 # def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
 #   """Sparse L'*D*L factorizaton of inertia-like matrix M, assumed spd."""
 
@@ -420,30 +469,19 @@ def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
 #     L[worldid, 0, ind] = M[worldid, 0, mapM2M[ind]]
 #   wp.launch(copy_CSR, dim=(d.nworld, m.nM), inputs=[L, M, d.mapM2M])
 
-#   rowadr = d.M_rowadr.numpy()
-#   rownnz = d.M_rownnz.numpy()
-#   colind = d.M_colind.numpy()
-
 #   @kernel
-#   def zone_3_acc(mat: wp.array(dtype=wp.float32, ndim=3),
-#                  rowadr: wp.array(dtype=wp.int32, ndim=1),
-#                  colind: wp.array(dtype=wp.int32, ndim=1),
-#                  diag_ind: wp.int32,
-#                  rowadr_k: wp.int32,
-#                  adr: wp.int32):
+#   def M_k_i(mat: wp.array(dtype=wp.float32, ndim=3),
+#             rowadr: wp.array(dtype=wp.int32, ndim=1),
+#             colind: wp.array(dtype=wp.int32, ndim=1),
+#             diag_ind: wp.int32,
+#             rowadr_k: wp.int32,
+#             adr: wp.int32):
+#     """ Process M(k, i) from Featherstone 2008, Table 6.3 """
 #     worldid, slice_ind = wp.tid()
 #     invD = 1.0 / mat[worldid, 0, diag_ind]
 #     tmp = mat[worldid, 0, adr] * invD
 #     i = colind[adr]
 #     mat[worldid, 0, rowadr[i] + slice_ind] -= tmp * mat[worldid, 0, rowadr_k + slice_ind]
-
-#   @kernel
-#   def set_zone_2(mat: wp.array(dtype=wp.float32, ndim=3),
-#                  adr: wp.int32,
-#                  diag_ind: wp.int32):
-#     worldid = wp.tid()
-#     invD = 1.0 / mat[worldid, 0, diag_ind]
-#     mat[worldid, 0, adr] *= invD
 
 #   @kernel
 #   def qlDiag_div(rownnz: wp.array(dtype=wp.int32, ndim=1), 
@@ -452,27 +490,123 @@ def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
 #     worldid, dofid = wp.tid()
 #     D[worldid, dofid] = 1.0 / L[worldid, 0, rowadr[dofid] + rownnz[dofid] - 1]
 
+#   @kernel
+#   def M_k_i_scale(mat: wp.array(dtype=wp.float32, ndim=3),
+#                   diag_ind: wp.array(dtype=wp.int32, ndim=1)):
+#     worldid, i = wp.tid()
+#     invD = 1.0 / mat[worldid, 0, diag_ind[i]]
+#     mat[worldid, 0, i] *= invD
+
+#   @kernel
+#   def store_diagonals(mat: wp.array(dtype=wp.float32, ndim=3),
+#                       D: wp.array(dtype=wp.float32, ndim=2),
+#                       diag_inds: wp.array(dtype=wp.int32, ndim=1)):
+#     worldid, i = wp.tid()
+#     D[worldid, i] = mat[worldid, 0, diag_inds[i]]
+
+#   @kernel
+#   def restore_diagonals(mat: wp.array(dtype=wp.float32, ndim=3),
+#                         D: wp.array(dtype=wp.float32, ndim=2),
+#                         diag_inds: wp.array(dtype=wp.int32, ndim=1)):
+#     worldid, i = wp.tid()
+#     mat[worldid, 0, diag_inds[i]] = D[worldid, i]
+
+#   rowadr = m.M_rowadr.numpy()
+#   rownnz = m.M_rownnz.numpy()
+#   colind = m.M_colind.numpy()
 #   for k in reversed(range(m.nv)):
 #     rowadr_k = rowadr[k]
-#     diag_k = rowadr_k + rownnz[k] - 1
-
+#     diag_k = rowadr[k] + rownnz[k] - 1
 #     for adr in range(diag_k - 1, rowadr_k - 1, -1):
 #       i = colind[adr]
-#       wp.launch(zone_3_acc, dim=(d.nworld, rownnz[i]), inputs=[
-#         L,
-#         wp.array(rowadr, dtype=wp.int32, ndim=1),
-#         wp.array(colind, dtype=wp.int32, ndim=1),
-#         wp.int32(diag_k),
-#         wp.int32(rowadr_k),
-#         wp.int32(adr)
-#       ])
-#       wp.launch(set_zone_2, dim=(d.nworld,), inputs=[
-#         L,
-#         wp.int32(adr),
-#         wp.int32(diag_k)
-#       ])
+#       wp.launch(M_k_i,
+#                 dim=(d.nworld, rownnz[i]),
+#                 inputs=[
+#                   L,
+#                   d.M_rowadr,
+#                   d.M_colind,
+#                   wp.int32(diag_k),
+#                   wp.int32(rowadr_k),
+#                   wp.int32(adr)
+#                 ])
 
+#   # Store diagonals 
+#   wp.launch(store_diagonals,
+#             dim=(d.nworld, m.nv),
+#             inputs=[
+#               L,
+#               D,
+#               m.M_diags
+#             ])
+#   wp.launch(M_k_i_scale,
+#             dim=(d.nworld, m.nM),
+#             inputs=[
+#               L,
+#               m.M_diag_ind
+#             ])
+#   # Restore diagonals
+#   wp.launch(restore_diagonals,
+#             dim=(d.nworld, m.nv),
+#             inputs=[
+#               L,
+#               D,
+#               m.M_diags
+#             ])
 #   wp.launch(qlDiag_div, dim=(d.nworld, m.nv), inputs=[d.M_rownnz, d.M_rowadr, L, D])
+
+
+#### Working Graph Capture but slow. 100+ units.
+# def _factor_i_sparse(m: Model, d: Data, M: array3df, L: array3df, D: array2df):
+#   """Sparse L'*D*L factorizaton of inertia-like matrix M, assumed spd."""
+
+#   @kernel
+#   def copy_CSR(L: wp.array(dtype=wp.float32, ndim=3),
+#                M: wp.array(dtype=wp.float32, ndim=3),
+#                mapM2M: wp.array(dtype=wp.int32, ndim=1)):
+#     worldid, ind = wp.tid()
+#     L[worldid, 0, ind] = M[worldid, 0, mapM2M[ind]]
+#   wp.launch(copy_CSR, dim=(d.nworld, m.nM), inputs=[L, M, d.mapM2M])
+
+#   @kernel
+#   def M_k_i(mat: wp.array(dtype=wp.float32, ndim=3),
+#             rowadr: wp.array(dtype=wp.int32, ndim=1),
+#             rownnz: wp.array(dtype=wp.int32, ndim=1),
+#             colind: wp.array(dtype=wp.int32, ndim=1),
+#             csr_index_vars: wp.array(dtype=wp.int32, ndim=2),
+#             iter_ind: wp.int32):
+#     """ Process M(k, i) from Featherstone 2008, Table 6.3 """
+#     worldid = wp.tid()
+#     update = csr_index_vars[iter_ind]
+#     rowadr_k, adr, diag_ind = update[0], update[1], update[2]
+#     invD = 1.0 / mat[worldid, 0, diag_ind]
+#     tmp = mat[worldid, 0, adr] * invD
+#     i = colind[adr]
+    
+#     for slice_ind in range(rownnz[i]):
+#       mat[worldid, 0, rowadr[i] + slice_ind] -= tmp * mat[worldid, 0, rowadr_k + slice_ind]
+    
+#     mat[worldid, 0, adr] = tmp
+
+#   @kernel
+#   def qlDiag_div(rownnz: wp.array(dtype=wp.int32, ndim=1), 
+#                  rowadr: wp.array(dtype=wp.int32, ndim=1), 
+#                  L: array3df, D: array2df):
+#     worldid, dofid = wp.tid()
+#     D[worldid, dofid] = 1.0 / L[worldid, 0, rowadr[dofid] + rownnz[dofid] - 1]
+
+#   for i in range(d.qLD_csr_index_vars.shape[0]):
+#     wp.launch(M_k_i,
+#               dim=(d.nworld),
+#               inputs=[
+#                 L,
+#                 d.M_rowadr,
+#                 d.M_rownnz,
+#                 d.M_colind,
+#                 d.qLD_csr_index_vars,
+#                 wp.int32(i)
+#               ])
+#   wp.launch(qlDiag_div, dim=(d.nworld, m.nv), inputs=[d.M_rownnz, d.M_rowadr, L, D])
+
 
 def _factor_i_dense(m: Model, d: Data, M: wp.array, L: wp.array):
   """Dense Cholesky factorizaton of inertia-like matrix M, assumed spd."""
@@ -505,7 +639,7 @@ def _factor_i_dense(m: Model, d: Data, M: wp.array, L: wp.array):
 
 def factor_i(m: Model, d: Data, M, L, D=None):
   """Factorizaton of inertia-like matrix M, assumed spd."""
-
+  assert m.opt.is_sparse # DEBUG
   if m.opt.is_sparse:
     assert D is not None
     _factor_i_sparse(m, d, M, L, D)

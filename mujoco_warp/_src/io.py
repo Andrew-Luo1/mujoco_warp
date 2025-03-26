@@ -147,6 +147,7 @@ def put_model(mjm: mujoco.MjModel) -> types.Model:
     qLD_update_tree = np.concatenate([qLD_updates[i] for i in range(len(qLD_updates))])
     tree_off = [0] + [len(qLD_updates[i]) for i in range(len(qLD_updates))]
     qLD_update_treeadr = np.cumsum(tree_off)[:-1]
+
   else:
     # qLD_tile has the dof id of each tile in qLD for dense factor m
     # qLD_tileadr contains starting index in qLD_tile of each tile group
@@ -331,7 +332,47 @@ def put_model(mjm: mujoco.MjModel) -> types.Model:
     np.any(mjm.actuator_biastype == types.BiasType.AFFINE.value)
     or np.any(mjm.actuator_gaintype == types.GainType.AFFINE.value)
   )
+  
+  # .numpy() doesn't work for Data fields in graph captured, non-kernel code. 
+  mjd = mujoco.MjData(mjm)
+  mjd.qvel = np.random.uniform(-0.01, 0.01, mjm.nv)
+  mujoco.mj_step(mjm, mjd, 3)  # let dynamics get state significantly non-zero
+  mujoco.mj_forward(mjm, mjd)
+  m.M_rownnz = wp.array(mjd.M_rownnz, dtype=wp.int32, ndim=1, device="cpu")
+  m.M_rowadr = wp.array(mjd.M_rowadr, dtype=wp.int32, ndim=1, device="cpu")
+  m.M_colind = wp.array(mjd.M_colind, dtype=wp.int32, ndim=1, device="cpu")
+  diag_inds = np.zeros(m.nM, dtype=np.int32)
+  m_diags = np.zeros(m.nv, dtype=np.int32)
+  i = 0
+  for k in range(m.nv):
+    rowadr_k = mjd.M_rowadr[k]
+    diag_k = mjd.M_rowadr[k] + mjd.M_rownnz[k] - 1
+    for _ in range(rowadr_k, diag_k + 1):
+      diag_inds[i] = diag_k
+      i += 1
+    m_diags[k] = diag_k
 
+  diag_inds = np.ascontiguousarray(diag_inds)
+  m.M_diag_ind = wp.array(diag_inds, dtype=wp.int32, ndim=1)
+  m.M_diags = wp.array(m_diags, dtype=wp.int32, ndim=1)
+  
+  loop_helper = []
+  row_starts = [0]
+  for k in reversed(range(m.nv)):
+    rowadr_k = mjd.M_rowadr[k]
+    diag_k = rowadr_k + mjd.M_rownnz[k] - 1
+    cur = []
+    for adr in range(diag_k - 1, rowadr_k - 1, -1):
+      i = mjd.M_colind[adr]
+      for slice_ind in range(mjd.M_rownnz[i]):
+        cur.append([adr, slice_ind])
+    row_starts.append(row_starts[-1] + len(cur))
+    loop_helper.extend(cur)
+
+  m.M_loop_helper = wp.array(loop_helper, dtype=wp.int32, ndim=2)
+  m.M_loop_helper_starts = wp.array(row_starts, dtype=wp.int32, ndim=1)
+  m.M_loop_helper_starts_cpu = wp.array(row_starts, dtype=wp.int32, ndim=1, device="cpu")
+  assert m.M_loop_helper_starts.shape == (m.nv + 1,)
   return m
 
 
@@ -451,6 +492,7 @@ def make_data(
   d.act_dot = wp.zeros((nworld, mjm.na), dtype=wp.float32)
   d.act = wp.zeros((nworld, mjm.na), dtype=wp.float32)
   d.qLDiagInv = wp.zeros((nworld, mjm.nv), dtype=wp.float32)
+  d.qLDiagInvnM = wp.zeros((nworld, mjm.nM), dtype=wp.float32)
   d.cvel = wp.zeros((nworld, mjm.nbody), dtype=wp.spatial_vector)
   d.cdof_dot = wp.zeros((nworld, mjm.nv), dtype=wp.spatial_vector)
   d.qfrc_bias = wp.zeros((nworld, mjm.nv), dtype=wp.float32)
@@ -729,6 +771,16 @@ def put_data(
   d.collision_pair = wp.empty(nconmax, dtype=wp.vec2i, ndim=1)
   d.collision_worldid = wp.empty(nconmax, dtype=wp.int32, ndim=1)
   d.ncollision = wp.zeros(1, dtype=wp.int32, ndim=1)
+
+  # iteration variables for CSR factor m
+  qLD_csr_index_vars = []
+  for k in reversed(range(mjm.nv)):
+    rowadr_k = mjd.M_rowadr[k]
+    diag_k = rowadr_k + mjd.M_rownnz[k] - 1
+    for adr in range(diag_k - 1, rowadr_k - 1, -1):
+      qLD_csr_index_vars.append((rowadr_k, adr, diag_k))
+
+  d.qLD_csr_index_vars = wp.array(qLD_csr_index_vars, dtype=wp.int32, ndim=2)
 
   return d
 
