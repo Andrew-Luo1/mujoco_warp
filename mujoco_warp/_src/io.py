@@ -424,6 +424,9 @@ def put_model(mjm: mujoco.MjModel) -> types.Model:
   m.eq_jnt_adr = wp.array(
     np.nonzero(mjm.eq_type == types.EqType.JOINT.value)[0], dtype=wp.int32, ndim=1
   )
+  m.eq_connect_adr = wp.array(
+    np.nonzero(mjm.eq_type == types.EqType.CONNECT.value)[0], dtype=wp.int32, ndim=1
+  )
 
   # short-circuiting here allows us to skip a lot of code in implicit integration
   m.actuator_affine_bias_gain = bool(

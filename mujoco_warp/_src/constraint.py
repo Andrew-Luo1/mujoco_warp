@@ -109,6 +109,70 @@ def _jac(
 
 
 @wp.kernel
+def _efc_equality_connect(
+  m: types.Model,
+  d: types.Data,
+  refsafe: bool,
+):
+  """Calculates constraint rows for connect equality constraints."""
+
+  worldid, i_eq_connect_adr = wp.tid()
+  i_eq = m.eq_connect_adr[i_eq_connect_adr] # TODO
+  # if not d.eq_active[worldid, i_eq]: # TODO: not there.
+  #   return
+  
+  efcid = wp.atomic_add(d.nefc, 0, 3)
+  d.efc.worldid[efcid] = worldid
+  
+  data = m.eq_data[i_eq]
+  anchor1 = wp.vec3f(data[0], data[1], data[2])
+  anchor2 = wp.vec3f(data[3], data[4], data[5])
+
+  if m.nsite and m.eq_objtype[i_eq] == wp.static(types.ObjType.SITE.value):
+    # body1id stores the index of site_bodyid.
+    body1id = m.site_bodyid[m.eq_obj1id[i_eq]]
+    body2id = m.site_bodyid[m.eq_obj2id[i_eq]]
+    pos1 = d.site_xpos[worldid, m.eq_obj1id[i_eq]]
+    pos2 = d.site_xpos[worldid, m.eq_obj2id[i_eq]]
+  else:
+    body1id = m.eq_obj1id[i_eq]
+    body2id = m.eq_obj2id[i_eq]
+    pos1 = d.xpos[worldid, body1id] + d.xmat[worldid, body1id] @ anchor1
+    pos2 = d.xpos[worldid, body2id] + d.xmat[worldid, body2id] @ anchor2
+
+  # error is difference in global positions
+  pos = pos1 - pos2
+
+  # compute Jacobian difference (opposite of contact: 0 - 1)
+  Jqvel = wp.vec3f(0.0, 0.0, 0.0)
+  for dofid in range(m.nv): # TODO: parallelize
+    j2mj1 = (_jac(m, d, pos1, body1id, dofid, worldid)
+           - _jac(m, d, pos2, body2id, dofid, worldid))
+    d.efc.J[efcid, dofid] = j2mj1[0]
+    d.efc.J[efcid + 1, dofid] = j2mj1[1]
+    d.efc.J[efcid + 2, dofid] = j2mj1[2]
+    Jqvel += j2mj1 * d.qvel[worldid, dofid]
+
+  invweight = m.body_invweight0[body1id, 0] + m.body_invweight0[body2id, 0]
+  pos_imp = wp.length(pos)
+
+  for i in range(3):
+    _update_efc_row(
+      m,
+      d,
+      efcid + i,
+      pos[i],
+      pos_imp,
+      invweight,
+      m.eq_solref[i_eq],
+      m.eq_solimp[i_eq],
+      wp.float32(0.0),
+      refsafe,
+      Jqvel[i],
+    )
+
+
+@wp.kernel
 def _efc_equality_joint(
   m: types.Model,
   d: types.Data,
@@ -346,8 +410,13 @@ def _efc_contact_elliptic(
     for i in range(m.nv):
       J = float(0.0)
       for xyz in range(3):
+<<<<<<< HEAD
         jac1p, _ = _jac(m, d, cpos, xyz, body1, i, worldid)
         jac2p, _ = _jac(m, d, cpos, xyz, body2, i, worldid)
+=======
+        jac1p = _jac(m, d, cpos, body1, i, worldid)[xyz]
+        jac2p = _jac(m, d, cpos, body2, i, worldid)[xyz]
+>>>>>>> 5375790 (connect constraint passes tests)
         jac_dif = jac2p - jac1p
         J += frame[dimid, xyz] * jac_dif
 
@@ -406,6 +475,11 @@ def make_constraint(m: types.Model, d: types.Data):
     refsafe = not m.opt.disableflags & types.DisableBit.REFSAFE.value
 
     if not (m.opt.disableflags & types.DisableBit.EQUALITY.value):
+      wp.launch(
+        _efc_equality_connect,
+        dim=(d.nworld, m.eq_connect_adr.size),
+        inputs=[m, d, refsafe],
+      )
       wp.launch(
         _efc_equality_joint,
         dim=(d.nworld, m.eq_jnt_adr.size),

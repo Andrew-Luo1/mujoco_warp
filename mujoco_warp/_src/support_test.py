@@ -55,6 +55,20 @@ class SupportTest(parameterized.TestCase):
 
     _assert_eq(res.numpy()[0], mj_res, f"mul_m ({'sparse' if sparse else 'dense'})")
 
+  @parameterized.parameters('constraints.xml', 'pendula.xml')
+  def test_jac(self, fname):
+    np.random.seed(0)
+    
+    mjm, mjd, m, d = test_util.fixture(fname)
+    point = np.random.randn(3)
+    body = np.random.choice(m.nbody)
+    jacp, jacr = mjwarp.jac(m, d, point, body) # TODO: not pure
+    
+    jacp_expected, jacr_expected = np.zeros((3, m.nv)), np.zeros((3, m.nv))
+    mujoco.mj_jac(mjm, mjd, jacp_expected, jacr_expected, point, body)
+    _assert_eq(jacp.numpy(), jacp_expected.T, f"jac ({fname})") # TODO: index
+    _assert_eq(jacr.numpy(), jacr_expected.T, f"jacr ({fname})")
+
   def test_xfrc_accumulated(self):
     """Tests that xfrc_accumulate ouput matches mj_xfrcAccumulate."""
     np.random.seed(0)
