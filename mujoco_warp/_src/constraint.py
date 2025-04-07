@@ -117,13 +117,13 @@ def _efc_equality_connect(
   """Calculates constraint rows for connect equality constraints."""
 
   worldid, i_eq_connect_adr = wp.tid()
-  i_eq = m.eq_connect_adr[i_eq_connect_adr] # TODO
+  i_eq = m.eq_connect_adr[i_eq_connect_adr]  # TODO
   # if not d.eq_active[worldid, i_eq]: # TODO: not there.
   #   return
-  
+
   efcid = wp.atomic_add(d.nefc, 0, 3)
   d.efc.worldid[efcid] = worldid
-  
+
   data = m.eq_data[i_eq]
   anchor1 = wp.vec3f(data[0], data[1], data[2])
   anchor2 = wp.vec3f(data[3], data[4], data[5])
@@ -145,9 +145,10 @@ def _efc_equality_connect(
 
   # compute Jacobian difference (opposite of contact: 0 - 1)
   Jqvel = wp.vec3f(0.0, 0.0, 0.0)
-  for dofid in range(m.nv): # TODO: parallelize
-    j2mj1 = (_jac(m, d, pos1, body1id, dofid, worldid)
-           - _jac(m, d, pos2, body2id, dofid, worldid))
+  for dofid in range(m.nv):  # TODO: parallelize
+    j2mj1 = _jac(m, d, pos1, body1id, dofid, worldid) - _jac(
+      m, d, pos2, body2id, dofid, worldid
+    )
     d.efc.J[efcid, dofid] = j2mj1[0]
     d.efc.J[efcid + 1, dofid] = j2mj1[1]
     d.efc.J[efcid + 2, dofid] = j2mj1[2]
