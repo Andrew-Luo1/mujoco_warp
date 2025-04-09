@@ -79,11 +79,10 @@ def _jac(
   m: types.Model,
   d: types.Data,
   point: wp.vec3,
-  xyz: wp.int32,
   bodyid: wp.int32,
   dofid: wp.int32,
   worldid: wp.int32,
-) -> Tuple[wp.float32, wp.float32]:
+) -> Tuple[wp.vec3f, wp.vec3f]:
   dof_bodyid = m.dof_bodyid[dofid]
   in_tree = int(dof_bodyid == 0)
   parentid = bodyid
@@ -94,7 +93,7 @@ def _jac(
     parentid = m.body_parentid[parentid]
 
   if not in_tree:
-    return 0.0, 0.0
+    return wp.vec3f(0.0, 0.0, 0.0), wp.vec3f(0.0, 0.0, 0.0)
 
   offset = point - wp.vec3(d.subtree_com[worldid, m.body_rootid[bodyid]])
 
@@ -102,10 +101,23 @@ def _jac(
   cdof_ang = wp.spatial_top(cdof)
   cdof_lin = wp.spatial_bottom(cdof)
 
-  jacp_xyz = (cdof_lin + wp.cross(cdof_ang, offset))[xyz]
-  jacr_xyz = cdof_ang[xyz]
+  jacp = (cdof_lin + wp.cross(cdof_ang, offset))
+  jacr = cdof_ang
 
-  return jacp_xyz, jacr_xyz
+  return jacp, jacr
+
+@wp.func
+def _jac_xyz(
+  m: types.Model,
+  d: types.Data,
+  point: wp.vec3,
+  xyz: wp.int32,
+  bodyid: wp.int32,
+  dofid: wp.int32,
+  worldid: wp.int32,
+) -> Tuple[wp.float32, wp.float32]:
+  jacp, jacr = _jac(m, d, point, bodyid, dofid, worldid)
+  return jacp[xyz], jacr[xyz]
 
 
 @wp.kernel
@@ -118,10 +130,11 @@ def _efc_equality_connect(
 
   worldid, i_eq_connect_adr = wp.tid()
   i_eq = m.eq_connect_adr[i_eq_connect_adr]  # TODO
-  # if not d.eq_active[worldid, i_eq]: # TODO: not there.
-  #   return
+  if not d.eq_active[worldid, i_eq]: # TODO: not there.
+    return
 
   efcid = wp.atomic_add(d.nefc, 0, 3)
+  wp.atomic_add(d.ne, 0, 3)
   d.efc.worldid[efcid] = worldid
 
   data = m.eq_data[i_eq]
@@ -146,13 +159,13 @@ def _efc_equality_connect(
   # compute Jacobian difference (opposite of contact: 0 - 1)
   Jqvel = wp.vec3f(0.0, 0.0, 0.0)
   for dofid in range(m.nv):  # TODO: parallelize
-    j2mj1 = _jac(m, d, pos1, body1id, dofid, worldid) - _jac(
-      m, d, pos2, body2id, dofid, worldid
-    )
-    d.efc.J[efcid, dofid] = j2mj1[0]
-    d.efc.J[efcid + 1, dofid] = j2mj1[1]
-    d.efc.J[efcid + 2, dofid] = j2mj1[2]
-    Jqvel += j2mj1 * d.qvel[worldid, dofid]
+    jacp1, _ = _jac(m, d, pos1, body1id, dofid, worldid)
+    jacp2, _ = _jac(m, d, pos2, body2id, dofid, worldid)
+    j1mj2 = jacp1 - jacp2
+    d.efc.J[efcid, dofid] = j1mj2[0]
+    d.efc.J[efcid + 1, dofid] = j1mj2[1]
+    d.efc.J[efcid + 2, dofid] = j1mj2[2]
+    Jqvel += j1mj2 * d.qvel[worldid, dofid]
 
   invweight = m.body_invweight0[body1id, 0] + m.body_invweight0[body2id, 0]
   pos_imp = wp.length(pos)
@@ -325,8 +338,8 @@ def _efc_contact_pyramidal(
       J = float(0.0)
       Ji = float(0.0)
       for xyz in range(3):
-        jac1p, jac1r = _jac(m, d, con_pos, xyz, body1, i, worldid)
-        jac2p, jac2r = _jac(m, d, con_pos, xyz, body2, i, worldid)
+        jac1p, jac1r = _jac_xyz(m, d, con_pos, xyz, body1, i, worldid)
+        jac2p, jac2r = _jac_xyz(m, d, con_pos, xyz, body2, i, worldid)
         jacp_dif = jac2p - jac1p
 
         J += frame[0, xyz] * jacp_dif
@@ -411,13 +424,8 @@ def _efc_contact_elliptic(
     for i in range(m.nv):
       J = float(0.0)
       for xyz in range(3):
-<<<<<<< HEAD
-        jac1p, _ = _jac(m, d, cpos, xyz, body1, i, worldid)
-        jac2p, _ = _jac(m, d, cpos, xyz, body2, i, worldid)
-=======
-        jac1p = _jac(m, d, cpos, body1, i, worldid)[xyz]
-        jac2p = _jac(m, d, cpos, body2, i, worldid)[xyz]
->>>>>>> 5375790 (connect constraint passes tests)
+        jac1p, _ = _jac_xyz(m, d, cpos, xyz, body1, i, worldid)
+        jac2p, _ = _jac_xyz(m, d, cpos, xyz, body2, i, worldid)
         jac_dif = jac2p - jac1p
         J += frame[dimid, xyz] * jac_dif
 
